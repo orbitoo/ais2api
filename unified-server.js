@@ -1432,8 +1432,14 @@ class RequestHandler {
     const googleEndpoint = useRealStream
       ? "streamGenerateContent"
       : "generateContent";
+
+    // 剥离所有功能后缀获取真实模型名
+    const realModelName = model
+      .replace("-nothinking", "")
+      .replace("-search", "");
+
     const proxyRequest = {
-      path: `/v1beta/models/${model}:${googleEndpoint}`,
+      path: `/v1beta/models/${realModelName}:${googleEndpoint}`,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       query_params: useRealStream ? { alt: "sse" } : {},
@@ -2112,6 +2118,13 @@ class RequestHandler {
   _translateOpenAIToGoogle(openaiBody, modelName = "") {
     this.logger.info("[Adapter] 开始将OpenAI请求格式翻译为Google格式...");
 
+    // 解析复合后缀
+    const isNoThinkingSuffix = modelName.includes("-nothinking");
+    const isSearchSuffix = modelName.includes("-search");
+    const baseModelName = modelName
+      .replace("-nothinking", "")
+      .replace("-search", "");
+
     let systemInstruction = null;
     const googleContents = [];
 
@@ -2206,37 +2219,58 @@ class RequestHandler {
         thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
       }
 
-      // 处理 Budget (预算)
-      // if (rawThinkingConfig.thinking_budget !== undefined) {
-      // thinkingConfig.thinkingBudgetTokenLimit =
-      // rawThinkingConfig.thinking_budget;
-      //} else if (rawThinkingConfig.thinkingBudget !== undefined) {
-      //thinkingConfig.thinkingBudgetTokenLimit =
-      //rawThinkingConfig.thinkingBudget;
-      //}
-
       this.logger.info(
         `[Adapter] 成功提取并转换推理配置: ${JSON.stringify(thinkingConfig)}`,
       );
     }
 
-    // 3. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
-    if (!thinkingConfig) {
-      const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
-      if (effort) {
+    // 3. 处理 -nothinking 后缀逻辑 (覆盖全局配置)
+    if (isNoThinkingSuffix) {
+      this.logger.info(
+        `[Adapter] 检测到 -nothinking 后缀，为模型 ${baseModelName} 注入特定推理压制配置。`,
+      );
+      thinkingConfig = thinkingConfig || { includeThoughts: true };
+
+      if (baseModelName.includes("2.5-pro")) {
+        // Case: 2.5-pro -> thinkingBudget: 128
+        thinkingConfig.includeThoughts = true;
+        thinkingConfig.thinkingBudgetTokenLimit = 128;
+      } else if (
+        baseModelName.includes("3.0") ||
+        baseModelName.includes("3.1") ||
+        baseModelName.includes("3.")
+      ) {
+        // Case: 3.x -> thinkingLevel: "LOW"
+        thinkingConfig.includeThoughts = true;
+        thinkingConfig.thinkingLevel = "LOW";
+      } else if (
+        baseModelName.includes("2.5-flash") ||
+        baseModelName.includes("flash-lite")
+      ) {
+        // Case: 2.5-flash -> thinkingBudget: 0
+        thinkingConfig.includeThoughts = true;
+        thinkingConfig.thinkingBudgetTokenLimit = 0;
+      }
+    } else {
+      // 如果没有后缀，则走正常的配置逻辑
+      // 3.1. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
+      if (!thinkingConfig) {
+        const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
+        if (effort) {
+          this.logger.info(
+            `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`,
+          );
+          thinkingConfig = { includeThoughts: true };
+        }
+      }
+
+      // 4. 强制开启逻辑 (WebUI开关)
+      if (this.serverSystem.forceThinking && !thinkingConfig) {
         this.logger.info(
-          `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`,
+          "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...",
         );
         thinkingConfig = { includeThoughts: true };
       }
-    }
-
-    // 4. 强制开启逻辑 (WebUI开关)
-    if (this.serverSystem.forceThinking && !thinkingConfig) {
-      this.logger.info(
-        "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...",
-      );
-      thinkingConfig = { includeThoughts: true };
     }
 
     // 5. 写入最终配置
@@ -2246,7 +2280,17 @@ class RequestHandler {
 
     googleRequest.generationConfig = generationConfig;
 
-    // 5. 安全设置
+    // 6. 注入搜索工具
+    if (isSearchSuffix) {
+      this.logger.info(`[Adapter] 检测到 -search 后缀，为模型 ${baseModelName} 开启 Google Search 工具。`);
+      googleRequest.tools = [
+        {
+          googleSearch: {}
+        }
+      ];
+    }
+
+    // 7. 安全设置
     googleRequest.safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
