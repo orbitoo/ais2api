@@ -174,12 +174,12 @@ class BrowserManager {
     this.logger = logger;
     this.config = config;
     this.authSource = authSource;
-    this.browser = null;
-    this.context = null;
-    this.page = null;
-    this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
-    this.noButtonCount = 0;
+    this.activeSlot = null;
+    this.standbySlot = null;
+    this.lastKnownAuthIndex = 0;
+    this.standbyWarmupPromise = null;
+    this.slotIdCounter = 0;
     this.launchArgs = [
       "--disable-dev-shm-usage", // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
       "--disable-gpu",
@@ -213,403 +213,152 @@ class BrowserManager {
     }
   }
 
+  get browser() {
+    return this.activeSlot?.browser || null;
+  }
+
+  get context() {
+    return this.activeSlot?.context || null;
+  }
+
+  get page() {
+    return this.activeSlot?.page || null;
+  }
+
+  get currentAuthIndex() {
+    return this.activeSlot?.authIndex || this.lastKnownAuthIndex || 0;
+  }
+
+  get standbyAuthIndex() {
+    return this.standbySlot?.authIndex || null;
+  }
+
+  hasStandbyReady() {
+    return this._isSlotReady(this.standbySlot);
+  }
+
   notifyUserActivity() {
-    if (this.noButtonCount > 0) {
+    const slot = this.activeSlot;
+    if (slot && slot.noButtonCount > 0) {
       this.logger.info(
         "[Browser] ⚡ 收到用户请求信号，强制唤醒后台检测 (重置计数器)",
       );
-      this.noButtonCount = 0;
+      slot.noButtonCount = 0;
     }
   }
 
   async launchOrSwitchContext(authIndex) {
-    if (!this.browser) {
-      this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
-      if (!fs.existsSync(this.browserExecutablePath)) {
-        throw new Error(
-          `Browser executable not found at path: ${this.browserExecutablePath}`,
-        );
-      }
-      let proxyConfig = undefined;
-      if (this.config.httpProxy) {
-        try {
-          const proxyUrl = new URL(this.config.httpProxy);
-          proxyConfig = {
-            server: `${proxyUrl.protocol}//${proxyUrl.host}`,
-            bypass: "localhost,127.0.0.1",
-          };
-          if (proxyUrl.username) proxyConfig.username = decodeURIComponent(proxyUrl.username);
-          if (proxyUrl.password) proxyConfig.password = decodeURIComponent(proxyUrl.password);
-        } catch (e) {
-          // 如果解析失败，回退到原始字符串
-          proxyConfig = { 
-            server: this.config.httpProxy,
-            bypass: "localhost,127.0.0.1"
-          };
-        }
-      }
-
-      this.browser = await firefox.launch({
-        headless: true,
-        executablePath: this.browserExecutablePath,
-        args: this.launchArgs,
-        proxy: proxyConfig,
-      });
-      this.browser.on("disconnected", () => {
-        this.logger.error("❌ [Browser] 浏览器意外断开连接！");
-        this.browser = null;
-        this.context = null;
-        this.page = null;
-      });
-      this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
-    }
-    if (this.context) {
-      this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
-      await this.context.close();
-      this.context = null;
-      this.page = null;
-      this.logger.info("[Browser] 旧上下文已关闭。");
+    const targetIndex =
+      authIndex || this.currentAuthIndex || this.authSource.availableIndices[0];
+    if (!targetIndex) {
+      throw new Error("No available authentication source to launch.");
     }
 
-    const sourceDescription =
-      this.authSource.authMode === "env"
-        ? `环境变量 AUTH_JSON_${authIndex}`
-        : `文件 auth-${authIndex}.json`;
     this.logger.info("==================================================");
     this.logger.info(
-      `🔄 [Browser] 正在为账号 #${authIndex} 创建新的浏览器上下文`,
+      `🔄 [Browser] 正在重建主用浏览器实例，目标账号 #${targetIndex}`,
     );
-    this.logger.info(`   • 认证源: ${sourceDescription}`);
     this.logger.info("==================================================");
 
-    const storageStateObject = this.authSource.getAuth(authIndex);
-    if (!storageStateObject) {
-      throw new Error(
-        `Failed to get or parse auth source for index ${authIndex}.`,
-      );
-    }
-    const buildScriptContent = fs.readFileSync(
-      path.join(__dirname, this.scriptFileName),
-      "utf-8",
-    );
+    const previousActive = this.activeSlot;
+    const previousStandby = this.standbySlot;
+    this.activeSlot = null;
+    this.standbySlot = null;
 
+    let replacementSlot = null;
     try {
-      this.context = await this.browser.newContext({
-        storageState: storageStateObject,
-        viewport: { width: 1920, height: 1080 },
-      });
-      this.page = await this.context.newPage();
-      this.page.on("console", (msg) => {
-        const msgText = msg.text();
-        if (msgText.includes("Content-Security-Policy: (Report-Only policy)")) {
-          return;
-        }
-        if (msgText.includes("[ProxyClient]")) {
-          this.logger.info(
-            `[Browser] ${msgText.replace("[ProxyClient] ", "")}`,
-          );
-        } else if (msg.type() === "error") {
-          this.logger.error(`[Browser Page Error] ${msgText}`);
-        }
-      });
+      replacementSlot = await this._createReadySlot(targetIndex, "active");
+      this.activeSlot = replacementSlot;
+      this.lastKnownAuthIndex = targetIndex;
 
-      // 增加 1：监听页面崩溃
-      this.page.on("crash", () => {
-        this.logger.error(
-          `🚨 [Browser] 致命：页面进程崩溃 (Crash)！当前账号索引: ${authIndex}`,
-        );
-      });
-
-      // 增加 2：监听意外的页面跳转或刷新
-      this.page.on("framenavigated", (frame) => {
-        // 只关注主框架的跳转
-        if (frame === this.page.mainFrame()) {
-          const newUrl = frame.url();
-          if (
-            newUrl !== "about:blank" &&
-            !newUrl.includes(this.config.targetUrl)
-          ) {
-            this.logger.warn(
-              `⚠️ [Browser] 页面发生了意外导航/刷新！新 URL: ${newUrl}`,
-            );
-          }
-        }
-      });
-
-      // 增加 3：监听 WebSocket 级别的错误 (方便对照)
-      this.page.on("websocket", (ws) => {
-        ws.on("close", () =>
-          this.logger.info(
-            `[Browser Network] 页面内的 WebSocket 连接已关闭: ${ws.url()}`,
-          ),
-        );
-        ws.on("error", (err) =>
-          this.logger.error(
-            `[Browser Network] 页面内的 WebSocket 发生错误: ${err}`,
-          ),
-        );
-      });
-
-      this.logger.info(`[Browser] 正在导航至目标网页...`);
-      const targetUrl = this.config.targetUrl;
-      await this.page.goto(targetUrl, {
-        timeout: 180000,
-        waitUntil: "domcontentloaded",
-      });
-      this.logger.info("[Browser] 页面加载完成。");
-
-      await this.page.waitForTimeout(3000);
-
-      const currentUrl = this.page.url();
-      let pageTitle = "";
-      try {
-        pageTitle = await this.page.title();
-      } catch (e) {
-        this.logger.warn(`[Browser] 无法获取页面标题: ${e.message}`);
-      }
-
-      this.logger.info(`[Browser] [诊断] URL: ${currentUrl}`);
-      this.logger.info(`[Browser] [诊断] Title: "${pageTitle}"`);
-
-      // 1. 检查 Cookie 是否失效 (跳转回登录页)
-      if (
-        currentUrl.includes("accounts.google.com") ||
-        currentUrl.includes("ServiceLogin") ||
-        pageTitle.includes("Sign in") ||
-        pageTitle.includes("登录")
-      ) {
-        throw new Error(
-          "🚨 Cookie 已失效/过期！浏览器被重定向到了 Google 登录页面。请重新提取 storageState。",
-        );
-      }
-
-      // 2. 检查 IP 地区限制 (Region Unsupported)
-      // 通常标题是 "Google AI Studio is not available in your location"
-      if (
-        pageTitle.includes("Available regions") ||
-        pageTitle.includes("not available")
-      ) {
-        throw new Error(
-          "🚨 当前 IP 不支持访问 Google AI Studio。请更换节点后重启！",
-        );
-      }
-
-      // 3. 检查 IP 风控 (403 Forbidden)
-      if (pageTitle.includes("403") || pageTitle.includes("Forbidden")) {
-        throw new Error(
-          "🚨 403 Forbidden：当前 IP 信誉过低，被 Google 风控拒绝访问。",
-        );
-      }
-
-      // 4. 检查白屏 (网络极差或加载失败)
-      if (currentUrl === "about:blank") {
-        throw new Error(
-          "🚨 页面加载失败 (about:blank)，可能是网络连接超时或浏览器崩溃。",
-        );
-      }
-
-      this.logger.info(
-        `[Browser] 进入 20秒 检查流程 (目标: Cookie + Got it + 新手引导)...`,
-      );
-
-      const startTime = Date.now();
-      const timeLimit = 20000;
-
-      // 状态记录表
-      const popupStatus = {
-        cookie: false,
-        gotIt: false,
-        guide: false,
-        continueBtn: false,
-      };
-
-      while (Date.now() - startTime < timeLimit) {
-        // 如果3个都处理过了，立刻退出 ---
-        if (popupStatus.cookie && popupStatus.gotIt && popupStatus.guide) {
-          this.logger.info(
-            `[Browser] ⚡ 完美！3个弹窗全部处理完毕，提前进入下一步。`,
-          );
-          break;
-        }
-
-        let clickedInThisLoop = false;
-
-        // 1. 检查 Cookie "Agree" (如果还没点过)
-        if (!popupStatus.cookie) {
-          try {
-            const agreeBtn = this.page.locator('button:text("Agree")').first();
-            if (await agreeBtn.isVisible({ timeout: 100 })) {
-              await agreeBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (1/3) 点击了 "Cookie Agree"`);
-              popupStatus.cookie = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        // 2. 检查 "Got it" (如果还没点过)
-        if (!popupStatus.gotIt) {
-          try {
-            const gotItBtn = this.page
-              .locator('div.dialog button:text("Got it")')
-              .first();
-            if (await gotItBtn.isVisible({ timeout: 100 })) {
-              await gotItBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (2/3) 点击了 "Got it" 弹窗`);
-              popupStatus.gotIt = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        // 3. 检查 新手引导 "Close" (如果还没点过)
-        if (!popupStatus.guide) {
-          try {
-            const closeBtn = this.page
-              .locator('button[aria-label="Close"]')
-              .first();
-            if (await closeBtn.isVisible({ timeout: 100 })) {
-              await closeBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (3/3) 点击了 "新手引导关闭" 按钮`);
-              popupStatus.guide = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        if (!popupStatus.continueBtn) {
-          try {
-            const clicked = await this.page.evaluate(() => {
-              const btns = Array.from(document.querySelectorAll("button"));
-              const target = btns.find(
-                (b) =>
-                  b.innerText && b.innerText.includes("Continue to the app"),
-              );
-              if (target) {
-                target.click();
-                return true;
-              }
-              return false;
-            });
-
-            if (clicked) {
-              this.logger.info(
-                `[Browser] ✅ (4/4) 原生JS成功点击 "Continue to the app"`,
-              );
-              popupStatus.continueBtn = true;
-              clickedInThisLoop = true;
-              this.logger.info(
-                `[Browser] ⚡ 已确认进入应用，提前终止弹窗等待循环。`,
-              );
-              break;
-            }
-          } catch (e) {}
-        }
-        try {
-          const isAppRunning = await this.page.evaluate(() => {
-            // 只要页面里出现了 ProxyClient 的输出，就说明代码已经跑起来了
-            return document.body.innerText.includes("[ProxyClient]");
-          });
-          if (isAppRunning) {
-            this.logger.info(
-              `[Browser] ⚡ 检测到内部环境已就绪，跳出弹窗等待。`,
-            );
-            break;
-          }
-        } catch (e) {}
-
-        // 如果本轮点击了按钮，稍微等一下动画；如果没点，等待1秒避免死循环空转
-        await this.page.waitForTimeout(clickedInThisLoop ? 500 : 1000);
-      }
-
-      this.logger.info(
-        `[Browser] 弹窗检查结束 (耗时: ${Math.round(
-          (Date.now() - startTime) / 1000,
-        )}s)，结果: ` +
-          `Cookie[${popupStatus.cookie ? "Ok" : "No"}], ` +
-          `GotIt[${popupStatus.gotIt ? "Ok" : "No"}], ` +
-          `Guide[${popupStatus.guide ? "Ok" : "No"}]`,
-      );
-
-      this.currentAuthIndex = authIndex;
-      this._startBackgroundWakeup();
-      this.logger.info("[Browser] (后台任务) 🛡️ 监控进程已启动...");
-      await this.page.waitForTimeout(1000);
-      this.logger.info(
-        "[Browser] ⚡ 正在发送主动唤醒请求以触发 Launch 流程...",
-      );
-      try {
-        await this.page.evaluate(async () => {
-          try {
-            await fetch(
-              "https://generativelanguage.googleapis.com/v1beta/models?key=ActiveTrigger",
-              {
-                method: "GET",
-                headers: { "Content-Type": "application/json" },
-              },
-            );
-          } catch (e) {
-            console.log(
-              "[ProxyClient] 主动唤醒请求已发送 (预期内可能会失败，这很正常)",
-            );
-          }
-        });
-        this.logger.info("[Browser] ⚡ 主动唤醒请求已发送。");
-      } catch (e) {
-        this.logger.warn(
-          `[Browser] 主动唤醒请求发送异常 (不影响主流程): ${e.message}`,
-        );
-      }
-
-      this.logger.info("==================================================");
-      this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
-      this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
-      this.logger.info("==================================================");
-      this._startBackgroundWakeup();
+      await this._destroySlot(previousActive, "replaced active slot");
+      await this._destroySlot(previousStandby, "reset standby slot");
+      await this._ensureStandbyReady({ blocking: true });
     } catch (error) {
-      this.logger.error(
-        `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`,
-      );
-      if (this.browser) {
-        await this.browser.close();
-        this.browser = null;
+      if (replacementSlot) {
+        await this._destroySlot(
+          replacementSlot,
+          "destroy failed replacement slot",
+        );
       }
+      this.activeSlot = this._isSlotReady(previousActive) ? previousActive : null;
+      this.standbySlot = this._isSlotReady(previousStandby)
+        ? previousStandby
+        : null;
+      this.logger.error(
+        `❌ [Browser] 账户 ${targetIndex} 的浏览器实例初始化失败: ${error.message}`,
+      );
       throw error;
     }
   }
 
   async closeBrowser() {
-    if (this.browser) {
-      this.logger.info("[Browser] 正在关闭整个浏览器实例...");
-      await this.browser.close();
-      this.browser = null;
-      this.context = null;
-      this.page = null;
-      this.logger.info("[Browser] 浏览器实例已关闭。");
-    }
+    const active = this.activeSlot;
+    const standby = this.standbySlot;
+    this.activeSlot = null;
+    this.standbySlot = null;
+    this.standbyWarmupPromise = null;
+    await this._destroySlot(standby, "shutdown standby slot");
+    await this._destroySlot(active, "shutdown active slot");
+    this.logger.info("[Browser] 所有浏览器实例已关闭。");
   }
 
   async switchAccount(newAuthIndex) {
+    if (
+      this._isSlotReady(this.activeSlot) &&
+      this.activeSlot.authIndex === newAuthIndex
+    ) {
+      this.logger.info(
+        `ℹ️ [Browser] 请求切换到当前活跃账号 #${newAuthIndex}，跳过。`,
+      );
+      return;
+    }
+
     this.logger.info(
       `🔄 [Browser] 开始账号切换: 从 ${this.currentAuthIndex} 到 ${newAuthIndex}`,
     );
-    await this.launchOrSwitchContext(newAuthIndex);
+    if (
+      this._isSlotReady(this.standbySlot) &&
+      this.standbySlot.authIndex === newAuthIndex
+    ) {
+      await this._promoteStandby(
+        `switch account to prewarmed standby #${newAuthIndex}`,
+      );
+    } else {
+      await this.launchOrSwitchContext(newAuthIndex);
+    }
     this.logger.info(
       `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`,
     );
   }
 
-  async _startBackgroundWakeup() {
-    const currentPage = this.page;
-    await new Promise((r) => setTimeout(r, 1500));
-    if (!currentPage || currentPage.isClosed() || this.page !== currentPage)
+  async recoverActiveSlot(preferredAuthIndex = null) {
+    if (this._isSlotReady(this.activeSlot)) {
       return;
-    this.logger.info("[Browser] (后台任务) 🛡️ 网页保活监控已启动");
-    while (
-      currentPage &&
-      !currentPage.isClosed() &&
-      this.page === currentPage
-    ) {
+    }
+
+    if (this._isSlotReady(this.standbySlot)) {
+      await this._promoteStandby("active slot unavailable, promote standby");
+      return;
+    }
+
+    const targetIndex =
+      preferredAuthIndex ||
+      this.currentAuthIndex ||
+      this.authSource.availableIndices[0];
+
+    await this.launchOrSwitchContext(targetIndex);
+  }
+
+  async _startBackgroundWakeup(slot) {
+    const currentPage = slot.page;
+    await new Promise((r) => setTimeout(r, 1500));
+    if (!currentPage || currentPage.isClosed() || slot.page !== currentPage)
+      return;
+    this.logger.info(
+      `[Browser] (后台任务) 🛡️ ${this._slotLabel(slot)} 网页保活监控已启动`,
+    );
+    while (currentPage && !currentPage.isClosed() && slot.page === currentPage) {
       try {
         // --- [增强步骤 1] 强制唤醒页面 (解决不发请求不刷新的问题) ---
         await currentPage.bringToFront().catch(() => {});
@@ -707,9 +456,9 @@ class BrowserManager {
 
         // --- [增强步骤 3] 执行操作 ---
         if (targetInfo.found) {
-          this.noButtonCount = 0;
+          slot.noButtonCount = 0;
           this.logger.info(
-            `[Browser] 🎯 锁定目标 [${targetInfo.tagName}] (策略: ${
+            `[Browser] ${this._slotLabel(slot)} 🎯 锁定目标 [${targetInfo.tagName}] (策略: ${
               targetInfo.strategy === "precise_css" ? "精准定位" : "模糊扫描"
             })...`,
           );
@@ -786,16 +535,18 @@ class BrowserManager {
             });
             await new Promise((r) => setTimeout(r, 2000));
           } else {
-            this.logger.info(`[Browser] ✅ 物理点击成功，按钮已消失。`);
+            this.logger.info(
+              `[Browser] ${this._slotLabel(slot)} ✅ 物理点击成功，按钮已消失。`,
+            );
             await new Promise((r) => setTimeout(r, 60000));
-            this.noButtonCount = 21;
+            slot.noButtonCount = 21;
           }
         } else {
-          this.noButtonCount++;
+          slot.noButtonCount++;
           // 5. [关键] 智能休眠逻辑 (支持被唤醒)
-          if (this.noButtonCount > 20) {
+          if (slot.noButtonCount > 20) {
             for (let i = 0; i < 30; i++) {
-              if (this.noButtonCount === 0) {
+              if (slot.noButtonCount === 0) {
                 break;
               }
               await new Promise((r) => setTimeout(r, 1000));
@@ -807,6 +558,583 @@ class BrowserManager {
       } catch (e) {
         await new Promise((r) => setTimeout(r, 1000));
       }
+    }
+  }
+
+  _createSlotDescriptor(role, authIndex) {
+    return {
+      id: ++this.slotIdCounter,
+      role,
+      authIndex,
+      browser: null,
+      context: null,
+      page: null,
+      noButtonCount: 0,
+      closing: false,
+      status: "initializing",
+    };
+  }
+
+  _slotLabel(slot) {
+    return `[${slot.role.toUpperCase()} #${slot.authIndex} | slot-${slot.id}]`;
+  }
+
+  _isSlotReady(slot) {
+    return (
+      !!slot &&
+      slot.status === "ready" &&
+      !!slot.browser &&
+      !!slot.context &&
+      !!slot.page &&
+      !slot.page.isClosed()
+    );
+  }
+
+  _buildProxyConfig() {
+    if (!this.config.httpProxy) {
+      return undefined;
+    }
+
+    try {
+      const proxyUrl = new URL(this.config.httpProxy);
+      const proxyConfig = {
+        server: `${proxyUrl.protocol}//${proxyUrl.host}`,
+        bypass: "localhost,127.0.0.1",
+      };
+      if (proxyUrl.username) {
+        proxyConfig.username = decodeURIComponent(proxyUrl.username);
+      }
+      if (proxyUrl.password) {
+        proxyConfig.password = decodeURIComponent(proxyUrl.password);
+      }
+      return proxyConfig;
+    } catch (e) {
+      return {
+        server: this.config.httpProxy,
+        bypass: "localhost,127.0.0.1",
+      };
+    }
+  }
+
+  _getNextAuthIndexAfter(authIndex) {
+    const available = this.authSource.availableIndices || [];
+    if (available.length === 0) return null;
+    if (available.length === 1) return available[0];
+
+    const currentIndexInArray = available.indexOf(authIndex);
+    if (currentIndexInArray === -1) {
+      return available[0];
+    }
+
+    return available[(currentIndexInArray + 1) % available.length];
+  }
+
+  async _createReadySlot(authIndex, role) {
+    if (!fs.existsSync(this.browserExecutablePath)) {
+      throw new Error(
+        `Browser executable not found at path: ${this.browserExecutablePath}`,
+      );
+    }
+
+    const slot = this._createSlotDescriptor(role, authIndex);
+    const sourceDescription =
+      this.authSource.authMode === "env"
+        ? `环境变量 AUTH_JSON_${authIndex}`
+        : `文件 auth-${authIndex}.json`;
+    const storageStateObject = this.authSource.getAuth(authIndex);
+
+    if (!storageStateObject) {
+      throw new Error(
+        `Failed to get or parse auth source for index ${authIndex}.`,
+      );
+    }
+
+    this.logger.info("==================================================");
+    this.logger.info(
+      `🚀 [Browser] ${this._slotLabel(slot)} 正在启动浏览器实例`,
+    );
+    this.logger.info(`   • 认证源: ${sourceDescription}`);
+    this.logger.info("==================================================");
+
+    try {
+      slot.browser = await firefox.launch({
+        headless: true,
+        executablePath: this.browserExecutablePath,
+        args: this.launchArgs,
+        proxy: this._buildProxyConfig(),
+      });
+      slot.browser.on("disconnected", () => {
+        void this._handleSlotDisconnected(slot);
+      });
+      slot.context = await slot.browser.newContext({
+        storageState: storageStateObject,
+        viewport: { width: 1920, height: 1080 },
+      });
+      slot.page = await slot.context.newPage();
+      this._attachPageHandlers(slot);
+      await this._preparePage(slot);
+      slot.status = "ready";
+      this.lastKnownAuthIndex = authIndex;
+      this._startBackgroundWakeup(slot).catch((error) => {
+        this.logger.warn(
+          `[Browser] ${this._slotLabel(slot)} 保活任务异常退出: ${error.message}`,
+        );
+      });
+
+      this.logger.info("==================================================");
+      this.logger.info(
+        `✅ [Browser] ${this._slotLabel(slot)} 浏览器客户端已准备就绪。`,
+      );
+      this.logger.info("==================================================");
+      return slot;
+    } catch (error) {
+      await this._destroySlot(
+        slot,
+        `slot initialization failed: ${error.message}`,
+      );
+      throw error;
+    }
+  }
+
+  _attachPageHandlers(slot) {
+    slot.page.on("console", (msg) => {
+      const msgText = msg.text();
+      if (msgText.includes("Content-Security-Policy: (Report-Only policy)")) {
+        return;
+      }
+      if (msgText.includes("[ProxyClient]")) {
+        this.logger.info(
+          `[Browser] ${this._slotLabel(slot)} ${msgText.replace(
+            "[ProxyClient] ",
+            "",
+          )}`,
+        );
+      } else if (msg.type() === "error") {
+        this.logger.error(
+          `[Browser Page Error] ${this._slotLabel(slot)} ${msgText}`,
+        );
+      }
+    });
+
+    slot.page.on("crash", () => {
+      this.logger.error(
+        `🚨 [Browser] ${this._slotLabel(
+          slot,
+        )} 页面进程崩溃 (Crash)！当前账号索引: ${slot.authIndex}`,
+      );
+    });
+
+    slot.page.on("framenavigated", (frame) => {
+      if (frame === slot.page.mainFrame()) {
+        const newUrl = frame.url();
+        if (newUrl !== "about:blank" && !newUrl.includes(this.config.targetUrl)) {
+          this.logger.warn(
+            `⚠️ [Browser] ${this._slotLabel(
+              slot,
+            )} 页面发生了意外导航/刷新！新 URL: ${newUrl}`,
+          );
+        }
+      }
+    });
+
+    slot.page.on("websocket", (ws) => {
+      ws.on("close", () =>
+        this.logger.info(
+          `[Browser Network] ${this._slotLabel(
+            slot,
+          )} 页面内的 WebSocket 连接已关闭: ${ws.url()}`,
+        ),
+      );
+      ws.on("error", (err) =>
+        this.logger.error(
+          `[Browser Network] ${this._slotLabel(
+            slot,
+          )} 页面内的 WebSocket 发生错误: ${err}`,
+        ),
+      );
+    });
+  }
+
+  async _preparePage(slot) {
+    this.logger.info(
+      `[Browser] ${this._slotLabel(slot)} 正在导航至目标网页...`,
+    );
+    await slot.page.goto(this.config.targetUrl, {
+      timeout: 180000,
+      waitUntil: "domcontentloaded",
+    });
+    this.logger.info(`[Browser] ${this._slotLabel(slot)} 页面加载完成。`);
+
+    await slot.page.waitForTimeout(3000);
+
+    const currentUrl = slot.page.url();
+    let pageTitle = "";
+    try {
+      pageTitle = await slot.page.title();
+    } catch (e) {
+      this.logger.warn(
+        `[Browser] ${this._slotLabel(slot)} 无法获取页面标题: ${e.message}`,
+      );
+    }
+
+    this.logger.info(
+      `[Browser] ${this._slotLabel(slot)} [诊断] URL: ${currentUrl}`,
+    );
+    this.logger.info(
+      `[Browser] ${this._slotLabel(slot)} [诊断] Title: "${pageTitle}"`,
+    );
+
+    if (
+      currentUrl.includes("accounts.google.com") ||
+      currentUrl.includes("ServiceLogin") ||
+      pageTitle.includes("Sign in") ||
+      pageTitle.includes("登录")
+    ) {
+      throw new Error(
+        "🚨 Cookie 已失效/过期！浏览器被重定向到了 Google 登录页面。请重新提取 storageState。",
+      );
+    }
+
+    if (
+      pageTitle.includes("Available regions") ||
+      pageTitle.includes("not available")
+    ) {
+      throw new Error("🚨 当前 IP 不支持访问 Google AI Studio。请更换节点后重启！");
+    }
+
+    if (pageTitle.includes("403") || pageTitle.includes("Forbidden")) {
+      throw new Error(
+        "🚨 403 Forbidden：当前 IP 信誉过低，被 Google 风控拒绝访问。",
+      );
+    }
+
+    if (currentUrl === "about:blank") {
+      throw new Error(
+        "🚨 页面加载失败 (about:blank)，可能是网络连接超时或浏览器崩溃。",
+      );
+    }
+
+    await this._handleInitialPopups(slot);
+    await slot.page.waitForTimeout(1000);
+    this.logger.info(
+      `[Browser] ${this._slotLabel(slot)} ⚡ 正在发送主动唤醒请求以触发 Launch 流程...`,
+    );
+    try {
+      await slot.page.evaluate(async () => {
+        try {
+          await fetch(
+            "https://generativelanguage.googleapis.com/v1beta/models?key=ActiveTrigger",
+            {
+              method: "GET",
+              headers: { "Content-Type": "application/json" },
+            },
+          );
+        } catch (e) {
+          console.log(
+            "[ProxyClient] 主动唤醒请求已发送 (预期内可能会失败，这很正常)",
+          );
+        }
+      });
+      this.logger.info(
+        `[Browser] ${this._slotLabel(slot)} ⚡ 主动唤醒请求已发送。`,
+      );
+    } catch (e) {
+      this.logger.warn(
+        `[Browser] ${this._slotLabel(
+          slot,
+        )} 主动唤醒请求发送异常 (不影响主流程): ${e.message}`,
+      );
+    }
+  }
+
+  async _handleInitialPopups(slot) {
+    this.logger.info(
+      `[Browser] ${this._slotLabel(
+        slot,
+      )} 进入 20秒 检查流程 (目标: Cookie + Got it + 新手引导)...`,
+    );
+
+    const startTime = Date.now();
+    const timeLimit = 20000;
+    const popupStatus = {
+      cookie: false,
+      gotIt: false,
+      guide: false,
+      continueBtn: false,
+    };
+
+    while (Date.now() - startTime < timeLimit) {
+      if (popupStatus.cookie && popupStatus.gotIt && popupStatus.guide) {
+        this.logger.info(
+          `[Browser] ${this._slotLabel(
+            slot,
+          )} ⚡ 完美！3个弹窗全部处理完毕，提前进入下一步。`,
+        );
+        break;
+      }
+
+      let clickedInThisLoop = false;
+
+      if (!popupStatus.cookie) {
+        try {
+          const agreeBtn = slot.page.locator('button:text("Agree")').first();
+          if (await agreeBtn.isVisible({ timeout: 100 })) {
+            await agreeBtn.click({ force: true });
+            this.logger.info(
+              `[Browser] ${this._slotLabel(slot)} ✅ (1/3) 点击了 "Cookie Agree"`,
+            );
+            popupStatus.cookie = true;
+            clickedInThisLoop = true;
+          }
+        } catch (e) {}
+      }
+
+      if (!popupStatus.gotIt) {
+        try {
+          const gotItBtn = slot.page
+            .locator('div.dialog button:text("Got it")')
+            .first();
+          if (await gotItBtn.isVisible({ timeout: 100 })) {
+            await gotItBtn.click({ force: true });
+            this.logger.info(
+              `[Browser] ${this._slotLabel(slot)} ✅ (2/3) 点击了 "Got it" 弹窗`,
+            );
+            popupStatus.gotIt = true;
+            clickedInThisLoop = true;
+          }
+        } catch (e) {}
+      }
+
+      if (!popupStatus.guide) {
+        try {
+          const closeBtn = slot.page
+            .locator('button[aria-label="Close"]')
+            .first();
+          if (await closeBtn.isVisible({ timeout: 100 })) {
+            await closeBtn.click({ force: true });
+            this.logger.info(
+              `[Browser] ${this._slotLabel(slot)} ✅ (3/3) 点击了 "新手引导关闭" 按钮`,
+            );
+            popupStatus.guide = true;
+            clickedInThisLoop = true;
+          }
+        } catch (e) {}
+      }
+
+      if (!popupStatus.continueBtn) {
+        try {
+          const clicked = await slot.page.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll("button"));
+            const target = btns.find(
+              (b) => b.innerText && b.innerText.includes("Continue to the app"),
+            );
+            if (target) {
+              target.click();
+              return true;
+            }
+            return false;
+          });
+
+          if (clicked) {
+            this.logger.info(
+              `[Browser] ${this._slotLabel(
+                slot,
+              )} ✅ (4/4) 原生JS成功点击 "Continue to the app"`,
+            );
+            popupStatus.continueBtn = true;
+            clickedInThisLoop = true;
+            this.logger.info(
+              `[Browser] ${this._slotLabel(
+                slot,
+              )} ⚡ 已确认进入应用，提前终止弹窗等待循环。`,
+            );
+            break;
+          }
+        } catch (e) {}
+      }
+
+      try {
+        const isAppRunning = await slot.page.evaluate(() => {
+          return document.body.innerText.includes("[ProxyClient]");
+        });
+        if (isAppRunning) {
+          this.logger.info(
+            `[Browser] ${this._slotLabel(slot)} ⚡ 检测到内部环境已就绪，跳出弹窗等待。`,
+          );
+          break;
+        }
+      } catch (e) {}
+
+      await slot.page.waitForTimeout(clickedInThisLoop ? 500 : 1000);
+    }
+
+    this.logger.info(
+      `[Browser] ${this._slotLabel(slot)} 弹窗检查结束 (耗时: ${Math.round(
+        (Date.now() - startTime) / 1000,
+      )}s)，结果: ` +
+        `Cookie[${popupStatus.cookie ? "Ok" : "No"}], ` +
+        `GotIt[${popupStatus.gotIt ? "Ok" : "No"}], ` +
+        `Guide[${popupStatus.guide ? "Ok" : "No"}]`,
+    );
+  }
+
+  async _promoteStandby(reason) {
+    if (!this._isSlotReady(this.standbySlot)) {
+      throw new Error("Standby browser slot is not ready.");
+    }
+
+    const previousActive = this.activeSlot;
+    const promotedSlot = this.standbySlot;
+    promotedSlot.role = "active";
+    this.activeSlot = promotedSlot;
+    this.standbySlot = null;
+    this.lastKnownAuthIndex = promotedSlot.authIndex;
+
+    this.logger.info("==================================================");
+    this.logger.info(
+      `🔁 [Browser] 预热实例已接管主用流量，原因: ${reason}`,
+    );
+    this.logger.info(
+      `   • 新主用账号: #${promotedSlot.authIndex} (${this._slotLabel(
+        promotedSlot,
+      )})`,
+    );
+    this.logger.info("==================================================");
+
+    await this._destroySlot(previousActive, "retire previous active slot");
+    this._ensureStandbyReady().catch((error) => {
+      this.logger.warn(
+        `[Browser] 预热下一账号失败: ${error.message}`,
+      );
+    });
+  }
+
+  async _ensureStandbyReady({ blocking = false } = {}) {
+    if (!this._isSlotReady(this.activeSlot)) {
+      return;
+    }
+
+    const targetAuthIndex = this._getNextAuthIndexAfter(this.activeSlot.authIndex);
+    if (!targetAuthIndex) {
+      return;
+    }
+
+    if (
+      this._isSlotReady(this.standbySlot) &&
+      this.standbySlot.authIndex === targetAuthIndex
+    ) {
+      return;
+    }
+
+    if (this.standbyWarmupPromise) {
+      if (blocking) {
+        await this.standbyWarmupPromise;
+      }
+      return;
+    }
+
+    const oldStandby = this.standbySlot;
+    this.standbySlot = null;
+
+    const warmupPromise = (async () => {
+      await this._destroySlot(oldStandby, "replace stale standby slot");
+      try {
+        const standbySlot = await this._createReadySlot(
+          targetAuthIndex,
+          "standby",
+        );
+        this.standbySlot = standbySlot;
+        this.logger.info(
+          `[Browser] ✅ 预热实例就绪：账号 #${targetAuthIndex} (${this._slotLabel(
+            standbySlot,
+          )})`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `[Browser] ⚠️ 预热账号 #${targetAuthIndex} 失败: ${error.message}`,
+        );
+        this.standbySlot = null;
+      }
+    })();
+
+    this.standbyWarmupPromise = warmupPromise.finally(() => {
+      if (this.standbyWarmupPromise === warmupPromise) {
+        this.standbyWarmupPromise = null;
+      }
+    });
+
+    if (blocking) {
+      await this.standbyWarmupPromise;
+    }
+  }
+
+  async _handleSlotDisconnected(slot) {
+    slot.browser = null;
+    slot.context = null;
+    slot.page = null;
+
+    if (slot.closing) {
+      slot.status = "closed";
+      return;
+    }
+
+    slot.status = "disconnected";
+    this.logger.error(`❌ [Browser] ${this._slotLabel(slot)} 浏览器意外断开连接！`);
+
+    if (this.activeSlot === slot) {
+      this.activeSlot = null;
+
+      if (this._isSlotReady(this.standbySlot)) {
+        this.logger.warn(
+          `[Browser] 主用实例断开，立即提升预热实例接管服务。`,
+        );
+        try {
+          await this._promoteStandby("active browser disconnected");
+        } catch (error) {
+          this.logger.error(
+            `[Browser] 提升预热实例失败: ${error.message}`,
+          );
+        }
+      }
+    } else if (this.standbySlot === slot) {
+      this.standbySlot = null;
+      this.logger.warn("[Browser] 预热实例断开，准备重新预热。");
+      this._ensureStandbyReady().catch((error) => {
+        this.logger.warn(
+          `[Browser] 重新预热预备实例失败: ${error.message}`,
+        );
+      });
+    }
+  }
+
+  async _destroySlot(slot, reason) {
+    if (!slot || slot.closing) {
+      return;
+    }
+
+    slot.closing = true;
+    slot.status = "closing";
+    this.logger.info(
+      `[Browser] 正在回收 ${this._slotLabel(slot)}，原因: ${reason}`,
+    );
+
+    try {
+      if (slot.browser) {
+        await slot.browser.close();
+      } else if (slot.context) {
+        await slot.context.close().catch(() => {});
+      } else if (slot.page && !slot.page.isClosed()) {
+        await slot.page.close().catch(() => {});
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[Browser] 回收 ${this._slotLabel(slot)} 时出现异常: ${error.message}`,
+      );
+    } finally {
+      slot.browser = null;
+      slot.context = null;
+      slot.page = null;
+      slot.status = "closed";
     }
   }
 }
@@ -1263,6 +1591,59 @@ class RequestHandler {
     }
   }
 
+  async _ensureBrowserReady(res) {
+    if (this.connectionRegistry.hasActiveConnections()) {
+      return true;
+    }
+
+    if (this.isSystemBusy) {
+      this.logger.warn(
+        "[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。",
+      );
+      this._sendErrorResponse(
+        res,
+        503,
+        "服务器正在进行内部维护（账号切换/恢复），请稍后重试。",
+      );
+      return false;
+    }
+
+    this.logger.error(
+      "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复...",
+    );
+
+    this.isSystemBusy = true;
+    try {
+      await this.browserManager.recoverActiveSlot(this.currentAuthIndex);
+      this.logger.info(`[System] 浏览器页面已加载，等待 WebSocket 握手...`);
+      let wsReady = false;
+      for (let i = 0; i < 20; i++) {
+        if (this.connectionRegistry.hasActiveConnections()) {
+          wsReady = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      if (!wsReady) {
+        throw new Error("浏览器已启动，但前端 WebSocket 始终未能连接到代理端。");
+      }
+
+      this.logger.info(`✅ [System] 浏览器与 WebSocket 已完全恢复就绪！`);
+      return true;
+    } catch (error) {
+      this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
+      this._sendErrorResponse(
+        res,
+        503,
+        "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。",
+      );
+      return false;
+    } finally {
+      this.isSystemBusy = false;
+    }
+  }
+
   async processRequest(req, res) {
     if (this.browserManager) {
       this.browserManager.notifyUserActivity();
@@ -1277,52 +1658,8 @@ class RequestHandler {
       }
     });
 
-    if (!this.connectionRegistry.hasActiveConnections()) {
-      if (this.isSystemBusy) {
-        this.logger.warn(
-          "[System] 检测到连接断开，但系统正在进行切换/恢复，拒绝新请求。",
-        );
-        return this._sendErrorResponse(
-          res,
-          503,
-          "服务器正在进行内部维护（账号切换/恢复），请稍后重试。",
-        );
-      }
-
-      this.logger.error(
-        "❌ [System] 检测到浏览器WebSocket连接已断开！可能是进程崩溃。正在尝试恢复...",
-      );
-      // --- 开始恢复前，加锁！ ---
-      this.isSystemBusy = true;
-      try {
-        await this.browserManager.launchOrSwitchContext(this.currentAuthIndex);
-        this.logger.info(`[System] 浏览器页面已加载，等待 WebSocket 握手...`);
-        let wsReady = false;
-        for (let i = 0; i < 20; i++) {
-          if (this.connectionRegistry.hasActiveConnections()) {
-            wsReady = true;
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-
-        if (!wsReady) {
-          throw new Error(
-            "浏览器已启动，但前端 WebSocket 始终未能连接到代理端。",
-          );
-        }
-        this.logger.info(`✅ [System] 浏览器与 WebSocket 已完全恢复就绪！`);
-      } catch (error) {
-        this.logger.error(`❌ [System] 浏览器自动恢复失败: ${error.message}`);
-        return this._sendErrorResponse(
-          res,
-          503,
-          "服务暂时不可用：后端浏览器实例崩溃且无法自动恢复，请联系管理员。",
-        );
-      } finally {
-        // 只有确信 WS 连上了，或者彻底失败了，才解锁
-        this.isSystemBusy = false;
-      }
+    if (!(await this._ensureBrowserReady(res))) {
+      return;
     }
 
     if (this.isSystemBusy) {
@@ -1401,6 +1738,11 @@ class RequestHandler {
     if (this.browserManager) {
       this.browserManager.notifyUserActivity();
     }
+
+    if (!(await this._ensureBrowserReady(res))) {
+      return;
+    }
+
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
     const model = req.body.model || "gemini-1.5-pro-latest";
@@ -2924,6 +3266,12 @@ class ProxyServerSystem extends EventEmitter {
 <span class="label">浏览器连接</span>: <span class="${
         browserManager.browser ? "status-ok" : "status-error"
       }">${!!browserManager.browser}</span>
+<span class="label">主用实例账号</span>: #${requestHandler.currentAuthIndex}
+<span class="label">预热实例账号</span>: ${
+        browserManager.hasStandbyReady()
+          ? `#${browserManager.standbyAuthIndex}`
+          : "预热中 / 不可用"
+      }
 --- 服务配置 ---
 <span class="label">流模式</span>: ${
         config.streamingMode
@@ -2978,6 +3326,8 @@ class ProxyServerSystem extends EventEmitter {
                 statusPre.innerHTML = 
                     '<span class="label">服务状态</span>: <span class="status-ok">Running</span>\\n' +
                     '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
+                    '<span class="label">主用实例账号</span>: #' + data.status.currentAuthIndex + '\\n' +
+                    '<span class="label">预热实例账号</span>: ' + data.status.standbyAuthIndex + '\\n' +
                     '--- 服务配置 ---\\n' +
                     '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
                     '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
@@ -3080,6 +3430,9 @@ class ProxyServerSystem extends EventEmitter {
           streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
           forceThinking: this.forceThinking ? "✅ 已启用" : "❌ 已关闭",
           browserConnected: !!browserManager.browser,
+          standbyAuthIndex: browserManager.hasStandbyReady()
+            ? `#${browserManager.standbyAuthIndex}`
+            : "预热中 / 不可用",
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
               ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
@@ -3309,4 +3662,3 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
-
