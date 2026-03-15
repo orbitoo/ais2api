@@ -48,9 +48,9 @@ def create_auth_zip():
 
         # 第二层：将内部包进行加密压缩
         print(f"正在进行第二层加密压缩...")
-        # 统一使用 AES-256 加密。这是 pyzipper 的强项，我们不再依赖过时的传统加密。
-        # 相应的，服务端也将改为使用 node-stream-zip 库来解压。
-        with pyzipper.AESZipFile(output_filename, 'w', compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
+        # 注意：这里改用兼容性最强的传统加密 (ZipCrypto)，以便 Linux 的 unzip 命令直接解压
+        with pyzipper.ZipFile(output_filename, 'w', compression=pyzipper.ZIP_DEFLATED) as zf:
+            zf.setencryption(pyzipper.Encryption.TRADITIONAL)
             zf.setpassword(password.encode('utf-8'))
             zf.write(temp_inner_zip, arcname="bundle.zip")
                 

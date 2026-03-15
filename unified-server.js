@@ -9,8 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
+const { execSync } = require("child_process");
 const https = require("https");
-const StreamZip = require("node-stream-zip");
 
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
@@ -3155,19 +3155,26 @@ async function initAuthFromZip(logger) {
     };
 
     await downloadWithRedirects(zipUrl, tempZip);
-    logger.info("   • 下载完成，正在进行第一层解压 (原生 AES)...");
+    logger.info("   • 下载完成，正在进行第一层解压 (AES)...");
 
-    // 2. 第一层解压 (使用 node-stream-zip 处理 AES)
-    const zip1 = new StreamZip.async({ file: tempZip, storeEntries: true, password: zipPass });
-    await zip1.extract(null, __dirname);
-    await zip1.close();
+    // 2. 第一层解压 (使用密码)
+    const passArg = zipPass ? `-P '${zipPass}'` : "";
+    try {
+      execSync(`unzip -o ${passArg} "${tempZip}" -d "${__dirname}"`);
+    } catch (e) {
+      const errMsg = e.stderr ? e.stderr.toString() : e.message;
+      throw new Error(`第一层解压失败: ${errMsg}`);
+    }
 
     // 3. 第二层解压 (bundle.zip)
     if (fs.existsSync(innerZip)) {
       logger.info("   • 正在进行第二层解压 (Bundle)...");
-      const zip2 = new StreamZip.async({ file: innerZip, storeEntries: true });
-      await zip2.extract(null, __dirname);
-      await zip2.close();
+      try {
+        execSync(`unzip -o "${innerZip}" -d "${__dirname}"`);
+      } catch (e) {
+        const errMsg = e.stderr ? e.stderr.toString() : e.message;
+        throw new Error(`第二层解压失败: ${errMsg}`);
+      }
     } else {
       logger.warn("   • 警告：未发现 bundle.zip，尝试直接使用一级解压结果。");
     }
@@ -3175,13 +3182,10 @@ async function initAuthFromZip(logger) {
     logger.info("✅ [Auth] 远程认证源加载成功！已更新 auth/ 目录。");
   } catch (error) {
     logger.error(`❌ [Auth] 自动加载远程认证源失败: ${error.message}`);
-    if (error.stack) logger.debug(error.stack);
   } finally {
     // 清理
-    try {
-      if (fs.existsSync(tempZip)) fs.unlinkSync(tempZip);
-      if (fs.existsSync(innerZip)) fs.unlinkSync(innerZip);
-    } catch (e) {}
+    if (fs.existsSync(tempZip)) fs.unlinkSync(tempZip);
+    if (fs.existsSync(innerZip)) fs.unlinkSync(innerZip);
   }
 }
 
