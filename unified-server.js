@@ -236,12 +236,16 @@ class BrowserManager {
           const proxyUrl = new URL(this.config.httpProxy);
           proxyConfig = {
             server: `${proxyUrl.protocol}//${proxyUrl.host}`,
+            bypass: "localhost,127.0.0.1",
           };
           if (proxyUrl.username) proxyConfig.username = decodeURIComponent(proxyUrl.username);
           if (proxyUrl.password) proxyConfig.password = decodeURIComponent(proxyUrl.password);
         } catch (e) {
           // 如果解析失败，回退到原始字符串
-          proxyConfig = { server: this.config.httpProxy };
+          proxyConfig = { 
+            server: this.config.httpProxy,
+            bypass: "localhost,127.0.0.1"
+          };
         }
       }
 
