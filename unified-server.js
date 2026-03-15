@@ -11,7 +11,7 @@ const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
 const https = require("https");
-const StreamZip = require("node-stream-zip");
+const unzipper = require("unzipper");
 
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
@@ -204,17 +204,9 @@ class BrowserManager {
     } else {
       const platform = os.platform();
       if (platform === "linux") {
-        this.browserExecutablePath = path.join(
-          __dirname,
-          "camoufox-linux",
-          "camoufox",
-        );
-      } else if (platform === "win32") {
-        this.browserExecutablePath = path.join(
-          __dirname,
-          "camoufox",
-          "camoufox.exe",
-        );
+        this.browserExecutablePath = path.join(__dirname, "camoufox-linux", "camoufox");
+      } else if (platform === "win32" || platform === "win64") {
+        this.browserExecutablePath = path.join(__dirname, "camoufox", "camoufox.exe");
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
       }
@@ -3139,7 +3131,6 @@ async function initAuthFromZip(logger) {
     const downloadWithRedirects = (url, dest, redirectCount = 0) => {
       return new Promise((resolve, reject) => {
         if (redirectCount > 5) return reject(new Error("重定向次数过多"));
-        
         https.get(url, (response) => {
           if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
             return resolve(downloadWithRedirects(response.headers.location, dest, redirectCount + 1));
@@ -3147,7 +3138,6 @@ async function initAuthFromZip(logger) {
           if (response.statusCode !== 200) {
             return reject(new Error(`下载失败，状态码: ${response.statusCode}`));
           }
-          
           const file = fs.createWriteStream(dest);
           response.pipe(file);
           file.on("finish", () => {
@@ -3162,33 +3152,35 @@ async function initAuthFromZip(logger) {
     };
 
     await downloadWithRedirects(zipUrl, tempZip);
-    logger.info("   • 下载完成，正在进行第一层解压 (AES)...");
+    logger.info("   • 下载完成，正在进行第一层解压 (AES/ZipCrypto)...");
 
-    // 2. 第一层解压 (使用密码)
-    try {
-      // StreamZip 对于加密文件通常需要在实例化时传入密码
-      const zip1 = new StreamZip.async({ 
-        file: tempZip,
-        storeEntries: true,
-        password: zipPass ? zipPass : undefined
-      });
-      // 并在此解压全部文件
-      await zip1.extract(null, __dirname);
-      await zip1.close();
-    } catch (e) {
-      throw new Error(`第一层解压失败: ${e.message}`);
+    // 2. 第一层解压 (使用 unzipper)
+    const directory1 = await unzipper.Open.file(tempZip);
+    // unzipper 的 extract 逻辑支持密码
+    for (const entry of directory1.files) {
+      const extractPath = path.join(__dirname, entry.path);
+      // 确保父目录存在
+      const parentDir = path.dirname(extractPath);
+      if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+      
+      const content = await entry.buffer(zipPass);
+      fs.writeFileSync(extractPath, content);
     }
+    logger.info("   • 第一层解压成功！");
 
     // 3. 第二层解压 (bundle.zip)
     if (fs.existsSync(innerZip)) {
       logger.info("   • 正在进行第二层解压 (Bundle)...");
-      try {
-        const zip2 = new StreamZip.async({ file: innerZip, storeEntries: true });
-        await zip2.extract(null, __dirname);
-        await zip2.close();
-      } catch (e) {
-        throw new Error(`第二层解压失败: ${e.message}`);
+      const directory2 = await unzipper.Open.file(innerZip);
+      for (const entry of directory2.files) {
+        const extractPath = path.join(__dirname, entry.path);
+        const parentDir = path.dirname(extractPath);
+        if (!fs.existsSync(parentDir)) fs.mkdirSync(parentDir, { recursive: true });
+        
+        const content = await entry.buffer();
+        fs.writeFileSync(extractPath, content);
       }
+      logger.info("   • 第二层解压成功！");
     } else {
       logger.warn("   • 警告：未发现 bundle.zip，尝试直接使用一级解压结果。");
     }
@@ -3197,7 +3189,6 @@ async function initAuthFromZip(logger) {
   } catch (error) {
     logger.error(`❌ [Auth] 自动加载远程认证源失败: ${error.message}`);
   } finally {
-    // 清理
     if (fs.existsSync(tempZip)) fs.unlinkSync(tempZip);
     if (fs.existsSync(innerZip)) fs.unlinkSync(innerZip);
   }
