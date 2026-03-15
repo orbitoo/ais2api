@@ -21,10 +21,10 @@ class AuthSource {
     this.initialIndices = [];
     this.accountNameMap = new Map();
 
-    if (process.env.AUTH_JSON_1) {
+    if (process.env.ACC_1 || process.env.AUTH_JSON_1) {
       this.authMode = "env";
       this.logger.info(
-        "[Auth] 检测到 AUTH_JSON_1 环境变量，切换到环境变量认证模式。",
+        `[Auth] 检测到 ${process.env.ACC_1 ? "ACC_1" : "AUTH_JSON_1"} 环境变量，切换到环境变量认证模式。`,
       );
     } else {
       this.logger.info(
@@ -46,12 +46,12 @@ class AuthSource {
   _discoverAvailableIndices() {
     let indices = [];
     if (this.authMode === "env") {
-      const regex = /^AUTH_JSON_(\d+)$/;
+      const regex = /^(ACC|AUTH_JSON)_(\d+)$/;
       // [关键修复] 完整的 for...in 循环，用于扫描所有环境变量
       for (const key in process.env) {
         const match = key.match(regex);
-        if (match && match[1]) {
-          indices.push(parseInt(match[1], 10));
+        if (match && match[2]) {
+          indices.push(parseInt(match[2], 10));
         }
       }
     } else {
@@ -128,7 +128,7 @@ class AuthSource {
   // 一个内部辅助函数，仅用于预检验，避免日志污染
   _getAuthContent(index) {
     if (this.authMode === "env") {
-      return process.env[`AUTH_JSON_${index}`];
+      return process.env[`ACC_${index}`] || process.env[`AUTH_JSON_${index}`];
     } else {
       const authFilePath = path.join(__dirname, "auth", `auth-${index}.json`);
       if (!fs.existsSync(authFilePath)) return null;
@@ -229,11 +229,26 @@ class BrowserManager {
           `Browser executable not found at path: ${this.browserExecutablePath}`,
         );
       }
+      let proxyConfig = undefined;
+      if (this.config.httpProxy) {
+        try {
+          const proxyUrl = new URL(this.config.httpProxy);
+          proxyConfig = {
+            server: `${proxyUrl.protocol}//${proxyUrl.host}`,
+          };
+          if (proxyUrl.username) proxyConfig.username = decodeURIComponent(proxyUrl.username);
+          if (proxyUrl.password) proxyConfig.password = decodeURIComponent(proxyUrl.password);
+        } catch (e) {
+          // 如果解析失败，回退到原始字符串
+          proxyConfig = { server: this.config.httpProxy };
+        }
+      }
+
       this.browser = await firefox.launch({
         headless: true,
         executablePath: this.browserExecutablePath,
         args: this.launchArgs,
-        proxy: this.config.httpProxy ? { server: this.config.httpProxy } : undefined,
+        proxy: proxyConfig,
       });
       this.browser.on("disconnected", () => {
         this.logger.error("❌ [Browser] 浏览器意外断开连接！");
@@ -800,6 +815,24 @@ class LoggingService {
     this.serviceName = serviceName;
     this.logBuffer = []; // 用于在内存中保存日志
     this.maxBufferSize = 100; // 最多保存100条
+    this.lockLog = process.env.LOCK_LOG === "true";
+    this.lockKey = process.env.LOCK_KEY || "default_unlock_key";
+  }
+
+  _encrypt(text) {
+    try {
+      const iv = crypto.randomBytes(16);
+      const cipher = crypto.createCipheriv(
+        "aes-256-cbc",
+        crypto.createHash("sha256").update(this.lockKey).digest(),
+        iv,
+      );
+      let encrypted = cipher.update(text, "utf8", "hex");
+      encrypted += cipher.final("hex");
+      return `[LOCKED] ${iv.toString("hex")}:${encrypted}`;
+    } catch (e) {
+      return `[LOCK_ERROR] ${text}`;
+    }
   }
 
   _formatMessage(level, message) {
@@ -817,16 +850,20 @@ class LoggingService {
   }
 
   info(message) {
-    console.log(this._formatMessage("INFO", message));
+    const formatted = this._formatMessage("INFO", message);
+    console.log(this.lockLog ? this._encrypt(formatted) : formatted);
   }
   error(message) {
-    console.error(this._formatMessage("ERROR", message));
+    const formatted = this._formatMessage("ERROR", message);
+    console.error(this.lockLog ? this._encrypt(formatted) : formatted);
   }
   warn(message) {
-    console.warn(this._formatMessage("WARN", message));
+    const formatted = this._formatMessage("WARN", message);
+    console.warn(this.lockLog ? this._encrypt(formatted) : formatted);
   }
   debug(message) {
-    console.debug(this._formatMessage("DEBUG", message));
+    const formatted = this._formatMessage("DEBUG", message);
+    console.debug(this.lockLog ? this._encrypt(formatted) : formatted);
   }
 }
 
@@ -2381,12 +2418,14 @@ class ProxyServerSystem extends EventEmitter {
     if (process.env.TARGET_URL) config.targetUrl = process.env.TARGET_URL;
     if (process.env.STREAMING_MODE)
       config.streamingMode = process.env.STREAMING_MODE;
-    if (process.env.FAILURE_THRESHOLD)
-      config.failureThreshold =
-        parseInt(process.env.FAILURE_THRESHOLD, 10) || config.failureThreshold;
-    if (process.env.SWITCH_ON_USES)
-      config.switchOnUses =
-        parseInt(process.env.SWITCH_ON_USES, 10) || config.switchOnUses;
+    // 重命名变量适配
+    const rawFailSwitch = process.env.FAIL_SWICH || process.env.FAILURE_THRESHOLD;
+    if (rawFailSwitch)
+      config.failureThreshold = parseInt(rawFailSwitch, 10) || config.failureThreshold;
+
+    const rawSwitch = process.env.SWICH || process.env.SWITCH_ON_USES;
+    if (rawSwitch)
+      config.switchOnUses = parseInt(rawSwitch, 10) || config.switchOnUses;
     if (process.env.MAX_RETRIES)
       config.maxRetries =
         parseInt(process.env.MAX_RETRIES, 10) || config.maxRetries;
@@ -2395,8 +2434,10 @@ class ProxyServerSystem extends EventEmitter {
         parseInt(process.env.RETRY_DELAY, 10) || config.retryDelay;
     if (process.env.CAMOUFOX_EXECUTABLE_PATH)
       config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
-    if (process.env.API_KEYS) {
-      config.apiKeys = process.env.API_KEYS.split(",");
+
+    const rawPassword = process.env.PASSWORD || process.env.API_KEYS;
+    if (rawPassword) {
+      config.apiKeys = rawPassword.split(",");
     }
     if (process.env.HTTP_PROXY) {
       config.httpProxy = process.env.HTTP_PROXY;
