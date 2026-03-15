@@ -233,6 +233,14 @@ class BrowserManager {
     return this.standbySlot?.authIndex || null;
   }
 
+  get activeSlotId() {
+    return this.activeSlot?.id || null;
+  }
+
+  get standbySlotId() {
+    return this.standbySlot?.id || null;
+  }
+
   hasStandbyReady() {
     return this._isSlotReady(this.standbySlot);
   }
@@ -616,6 +624,18 @@ class BrowserManager {
     }
   }
 
+  _buildSlotWebSocketEndpoint(slot) {
+    const wsHost =
+      this.config.host && this.config.host !== "0.0.0.0"
+        ? this.config.host
+        : "127.0.0.1";
+    const url = new URL(`ws://${wsHost}:${this.config.wsPort}`);
+    url.searchParams.set("slotId", String(slot.id));
+    url.searchParams.set("role", slot.role);
+    url.searchParams.set("authIndex", String(slot.authIndex));
+    return url.toString();
+  }
+
   _getNextAuthIndexAfter(authIndex) {
     const available = this.authSource.availableIndices || [];
     if (available.length === 0) return null;
@@ -670,6 +690,51 @@ class BrowserManager {
         storageState: storageStateObject,
         viewport: { width: 1920, height: 1080 },
       });
+      const desiredEndpoint = this._buildSlotWebSocketEndpoint(slot);
+      await slot.context.addInitScript(
+        ({ endpoint }) => {
+          const NativeWebSocket = window.WebSocket;
+          if (!NativeWebSocket || window.__AIS_PROXY_WS_PATCHED__) {
+            window.__PROXY_WS_ENDPOINT = endpoint;
+            return;
+          }
+
+          const endpointBase = endpoint.split("?")[0];
+          const defaultEndpoint = "ws://127.0.0.1:9998";
+
+          class PatchedWebSocket extends NativeWebSocket {
+            constructor(url, protocols) {
+              const rawUrl = typeof url === "string" ? url : String(url);
+              const nextUrl =
+                rawUrl === defaultEndpoint || rawUrl.startsWith(`${defaultEndpoint}?`)
+                  ? endpoint
+                  : rawUrl === endpointBase || rawUrl.startsWith(`${endpointBase}?`)
+                    ? endpoint
+                    : rawUrl;
+              super(nextUrl, protocols);
+            }
+          }
+
+          Object.defineProperty(PatchedWebSocket, "CONNECTING", {
+            value: NativeWebSocket.CONNECTING,
+          });
+          Object.defineProperty(PatchedWebSocket, "OPEN", {
+            value: NativeWebSocket.OPEN,
+          });
+          Object.defineProperty(PatchedWebSocket, "CLOSING", {
+            value: NativeWebSocket.CLOSING,
+          });
+          Object.defineProperty(PatchedWebSocket, "CLOSED", {
+            value: NativeWebSocket.CLOSED,
+          });
+          PatchedWebSocket.prototype = NativeWebSocket.prototype;
+
+          window.WebSocket = PatchedWebSocket;
+          window.__AIS_PROXY_WS_PATCHED__ = true;
+          window.__PROXY_WS_ENDPOINT = endpoint;
+        },
+        { endpoint: desiredEndpoint },
+      );
       slot.page = await slot.context.newPage();
       this._attachPageHandlers(slot);
       await this._preparePage(slot);
@@ -1255,6 +1320,8 @@ class ConnectionRegistry extends EventEmitter {
     this.logger = logger;
     this.connections = new Set();
     this.messageQueues = new Map();
+    this.slotConnections = new Map();
+    this.connectionMetadata = new WeakMap();
     this.reconnectGraceTimer = null; // 新增：用于缓冲期计时的定时器
   }
   addConnection(websocket, clientInfo) {
@@ -1266,7 +1333,29 @@ class ConnectionRegistry extends EventEmitter {
     }
     // --- 修改结束 ---
 
+    const normalizedInfo = {
+      ...clientInfo,
+      slotId:
+        clientInfo && clientInfo.slotId !== undefined && clientInfo.slotId !== null
+          ? String(clientInfo.slotId)
+          : null,
+    };
+
+    if (normalizedInfo.slotId) {
+      const existingConnection = this.slotConnections.get(normalizedInfo.slotId);
+      if (existingConnection && existingConnection !== websocket) {
+        this.logger.warn(
+          `[Server] slot ${normalizedInfo.slotId} 检测到新的 WebSocket 连接，准备替换旧连接。`,
+        );
+        try {
+          existingConnection.close();
+        } catch (e) {}
+      }
+      this.slotConnections.set(normalizedInfo.slotId, websocket);
+    }
+
     this.connections.add(websocket);
+    this.connectionMetadata.set(websocket, normalizedInfo);
     websocket.on("message", (data) =>
       this._handleIncomingMessage(data.toString()),
     );
@@ -1278,8 +1367,21 @@ class ConnectionRegistry extends EventEmitter {
   }
 
   _removeConnection(websocket) {
+    const metadata = this.connectionMetadata.get(websocket);
     this.connections.delete(websocket);
-    this.logger.warn("[Server] 内部WebSocket客户端连接断开。");
+    if (metadata?.slotId && this.slotConnections.get(metadata.slotId) === websocket) {
+      this.slotConnections.delete(metadata.slotId);
+    }
+
+    if (metadata?.slotId) {
+      this.logger.warn(
+        `[Server] 内部WebSocket客户端连接断开。slot=${metadata.slotId}, role=${
+          metadata.role || "unknown"
+        }, auth=${metadata.authIndex || "unknown"}`,
+      );
+    } else {
+      this.logger.warn("[Server] 内部WebSocket客户端连接断开。");
+    }
 
     // --- 核心修改：不立即清理队列，而是启动一个缓冲期 ---
     this.logger.info("[Server] 启动5秒重连缓冲期...");
@@ -1339,6 +1441,12 @@ class ConnectionRegistry extends EventEmitter {
   getFirstConnection() {
     return this.connections.values().next().value;
   }
+  getConnectionBySlotId(slotId) {
+    if (slotId === undefined || slotId === null) {
+      return null;
+    }
+    return this.slotConnections.get(String(slotId)) || null;
+  }
   createMessageQueue(requestId) {
     const queue = new MessageQueue();
     this.messageQueues.set(requestId, queue);
@@ -1379,6 +1487,12 @@ class RequestHandler {
 
   get currentAuthIndex() {
     return this.browserManager.currentAuthIndex;
+  }
+
+  _getActiveBrowserConnection() {
+    return this.connectionRegistry.getConnectionBySlotId(
+      this.browserManager.activeSlotId,
+    );
   }
 
   _getMaxAuthIndex() {
@@ -1592,7 +1706,7 @@ class RequestHandler {
   }
 
   async _ensureBrowserReady(res) {
-    if (this.connectionRegistry.hasActiveConnections()) {
+    if (this._getActiveBrowserConnection()) {
       return true;
     }
 
@@ -1618,7 +1732,7 @@ class RequestHandler {
       this.logger.info(`[System] 浏览器页面已加载，等待 WebSocket 握手...`);
       let wsReady = false;
       for (let i = 0; i < 20; i++) {
-        if (this.connectionRegistry.hasActiveConnections()) {
+        if (this._getActiveBrowserConnection()) {
           wsReady = true;
           break;
         }
@@ -1991,7 +2105,7 @@ class RequestHandler {
 
   // --- 新增一个辅助方法，用于发送取消指令 ---
   _cancelBrowserRequest(requestId) {
-    const connection = this.connectionRegistry.getFirstConnection();
+    const connection = this._getActiveBrowserConnection();
     if (connection) {
       this.logger.info(
         `[Request] 正在向浏览器发送取消请求 #${requestId} 的指令...`,
@@ -2097,11 +2211,11 @@ class RequestHandler {
     };
   }
   _forwardRequest(proxyRequest) {
-    const connection = this.connectionRegistry.getFirstConnection();
+    const connection = this._getActiveBrowserConnection();
     if (connection) {
       connection.send(JSON.stringify(proxyRequest));
     } else {
-      throw new Error("无法转发请求：没有可用的WebSocket连接。");
+      throw new Error("无法转发请求：当前主用浏览器没有可用的WebSocket连接。");
     }
   }
   _sendErrorChunkToClient(res, errorMessage) {
@@ -3552,8 +3666,14 @@ class ProxyServerSystem extends EventEmitter {
       host: this.config.host,
     });
     this.wsServer.on("connection", (ws, req) => {
+      const baseHost =
+        req.headers.host || `${this.config.host || "127.0.0.1"}:${this.config.wsPort}`;
+      const requestUrl = new URL(req.url || "/", `ws://${baseHost}`);
       this.connectionRegistry.addConnection(ws, {
         address: req.socket.remoteAddress,
+        slotId: requestUrl.searchParams.get("slotId"),
+        role: requestUrl.searchParams.get("role"),
+        authIndex: requestUrl.searchParams.get("authIndex"),
       });
     });
   }

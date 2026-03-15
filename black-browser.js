@@ -16,7 +16,11 @@ const Logger = {
 class ConnectionManager extends EventTarget {
   // =================================================================
   // ===                 *** 请修改此行   *** ===
-  constructor(endpoint = "ws://127.0.0.1:9998") {
+  constructor(
+    endpoint =
+      (typeof window !== "undefined" && window.__PROXY_WS_ENDPOINT) ||
+      "ws://127.0.0.1:9998",
+  ) {
     // =================================================================
     super();
     this.endpoint = endpoint;
@@ -453,6 +457,11 @@ class ProxySystem extends EventTarget {
 }
 
 async function initializeProxySystem() {
+  if (window.__AIS_PROXY_SYSTEM_STARTED__) {
+    Logger.output("代理系统已初始化，跳过重复启动。");
+    return;
+  }
+  window.__AIS_PROXY_SYSTEM_STARTED__ = true;
   // 清理旧的日志
   document.body.innerHTML = "";
   const proxySystem = new ProxySystem();
