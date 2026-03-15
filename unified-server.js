@@ -9,8 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
-const { execSync } = require("child_process");
 const https = require("https");
+const StreamZip = require("node-stream-zip");
 
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
@@ -3158,22 +3158,24 @@ async function initAuthFromZip(logger) {
     logger.info("   • 下载完成，正在进行第一层解压 (AES)...");
 
     // 2. 第一层解压 (使用密码)
-    const passArg = zipPass ? `-P '${zipPass}'` : "";
     try {
-      execSync(`unzip -o ${passArg} "${tempZip}" -d "${__dirname}"`);
+      const zip1 = new StreamZip.async({ file: tempZip });
+      const extractOptions = zipPass ? { password: zipPass } : {};
+      await zip1.extract(null, __dirname, extractOptions);
+      await zip1.close();
     } catch (e) {
-      const errMsg = e.stderr ? e.stderr.toString() : e.message;
-      throw new Error(`第一层解压失败: ${errMsg}`);
+      throw new Error(`第一层解压失败: ${e.message}`);
     }
 
     // 3. 第二层解压 (bundle.zip)
     if (fs.existsSync(innerZip)) {
       logger.info("   • 正在进行第二层解压 (Bundle)...");
       try {
-        execSync(`unzip -o "${innerZip}" -d "${__dirname}"`);
+        const zip2 = new StreamZip.async({ file: innerZip });
+        await zip2.extract(null, __dirname);
+        await zip2.close();
       } catch (e) {
-        const errMsg = e.stderr ? e.stderr.toString() : e.message;
-        throw new Error(`第二层解压失败: ${errMsg}`);
+        throw new Error(`第二层解压失败: ${e.message}`);
       }
     } else {
       logger.warn("   • 警告：未发现 bundle.zip，尝试直接使用一级解压结果。");
