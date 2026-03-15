@@ -13,5 +13,8 @@
     "playwright": "^1.53.1",
     "unzipper": "^0.12.3",
     "ws": "^8.17.0"
+  },
+  "scripts": {
+    "update:code-index": "node scripts/update-code-index.js"
   }
 }
