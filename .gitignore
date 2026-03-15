@@ -5,3 +5,7 @@
 log/
 log_decode/
 log_decode.py
+.env
+auth.zip
+test-extract.js
+test.js

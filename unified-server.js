@@ -1,3 +1,4 @@
+require("dotenv").config();
 const session = require("express-session");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
@@ -207,6 +208,12 @@ class BrowserManager {
           __dirname,
           "camoufox-linux",
           "camoufox",
+        );
+      } else if (platform === "win32") {
+        this.browserExecutablePath = path.join(
+          __dirname,
+          "camoufox",
+          "camoufox.exe",
         );
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
