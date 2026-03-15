@@ -233,6 +233,7 @@ class BrowserManager {
         headless: true,
         executablePath: this.browserExecutablePath,
         args: this.launchArgs,
+        proxy: this.config.httpProxy ? { server: this.config.httpProxy } : undefined,
       });
       this.browser.on("disconnected", () => {
         this.logger.error("❌ [Browser] 浏览器意外断开连接！");
@@ -2360,6 +2361,7 @@ class ProxyServerSystem extends EventEmitter {
       // [新增] 用于追踪API密钥来源
       apiKeySource: "未设置",
       targetUrl: "https://ai.studio/apps/59d6e5ae-e3bb-494d-b942-2da1adab2ba0",
+      httpProxy: null,
     };
 
     const configPath = path.join(__dirname, "config.json");
@@ -2395,6 +2397,9 @@ class ProxyServerSystem extends EventEmitter {
       config.browserExecutablePath = process.env.CAMOUFOX_EXECUTABLE_PATH;
     if (process.env.API_KEYS) {
       config.apiKeys = process.env.API_KEYS.split(",");
+    }
+    if (process.env.HTTP_PROXY) {
+      config.httpProxy = process.env.HTTP_PROXY;
     }
 
     let rawCodes = process.env.IMMEDIATE_SWITCH_STATUS_CODES;
@@ -2488,6 +2493,12 @@ class ProxyServerSystem extends EventEmitter {
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
     this.logger.info(`  重试间隔: ${this.config.retryDelay}ms`);
     this.logger.info(`  API 密钥来源: ${this.config.apiKeySource}`); // 在启动日志中也显示出来
+    if (this.config.httpProxy) {
+      const maskedProxy = this.config.httpProxy.replace(/:[^:@/]+@/, ":****@");
+      this.logger.info(`  浏览器代理: ${maskedProxy}`);
+    } else {
+      this.logger.info(`  浏览器代理: 已禁用`);
+    }
     this.logger.info(
       "=============================================================",
     );
