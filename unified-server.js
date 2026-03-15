@@ -1517,6 +1517,9 @@ class RequestHandler {
               break;
             }
             if (message.data) {
+              if (process.env.DEBUG === "true") {
+                this.logger.info(`[DEBUG] 收到原始 Google API 数据块:\n${message.data}`);
+              }
               // [修改] 将 streamState 传递给翻译函数
               const translatedChunk = this._translateGoogleToOpenAIStream(
                 message.data,
@@ -2229,27 +2232,23 @@ class RequestHandler {
       this.logger.info(
         `[Adapter] 检测到 -nothinking 后缀，为模型 ${baseModelName} 注入特定推理压制配置。`,
       );
-      thinkingConfig = thinkingConfig || { includeThoughts: true };
-
+      
       if (baseModelName.includes("2.5-pro")) {
-        // Case: 2.5-pro -> thinkingBudget: 128
-        thinkingConfig.includeThoughts = true;
-        thinkingConfig.thinkingBudgetTokenLimit = 128;
+        // Case: 2.5-pro -> thinkingBudget: 128 (用户确认最低128)
+        thinkingConfig = { thinkingBudget: 128 };
       } else if (
         baseModelName.includes("3.0") ||
         baseModelName.includes("3.1") ||
         baseModelName.includes("3.")
       ) {
         // Case: 3.x -> thinkingLevel: "LOW"
-        thinkingConfig.includeThoughts = true;
-        thinkingConfig.thinkingLevel = "LOW";
+        thinkingConfig = { thinkingLevel: "LOW" };
       } else if (
         baseModelName.includes("2.5-flash") ||
         baseModelName.includes("flash-lite")
       ) {
         // Case: 2.5-flash -> thinkingBudget: 0
-        thinkingConfig.includeThoughts = true;
-        thinkingConfig.thinkingBudgetTokenLimit = 0;
+        thinkingConfig = { thinkingBudget: 0 };
       }
     } else {
       // 如果没有后缀，则走正常的配置逻辑
