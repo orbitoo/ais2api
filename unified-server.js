@@ -1436,7 +1436,8 @@ class RequestHandler {
     // 剥离所有功能后缀获取真实模型名
     const realModelName = model
       .replace("-nothinking", "")
-      .replace("-search", "");
+      .replace("-search", "")
+      .trim();
 
     const proxyRequest = {
       path: `/v1beta/models/${realModelName}:${googleEndpoint}`,
