@@ -9,6 +9,8 @@ const fs = require("fs");
 const path = require("path");
 const { firefox } = require("playwright");
 const os = require("os");
+const { execSync } = require("child_process");
+const https = require("https");
 
 // ===================================================================================
 // AUTH SOURCE MANAGEMENT MODULE
@@ -3116,7 +3118,72 @@ class ProxyServerSystem extends EventEmitter {
 // MAIN INITIALIZATION
 // ===================================================================================
 
+async function initAuthFromZip(logger) {
+  const zipUrl = process.env.ZIP_URL;
+  const zipPass = process.env.ZIP_PASSWORD;
+  if (!zipUrl) return;
+
+  logger.info(`[Auth] 探测到 ZIP_URL: ${zipUrl.split("?")[0]}，准备拉取远程认证源...`);
+  const tempZip = path.join(__dirname, "remote_auth.zip");
+  const innerZip = path.join(__dirname, "bundle.zip");
+
+  try {
+    // 1. 下载文件
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(tempZip);
+      https.get(zipUrl, (response) => {
+        if (response.statusCode !== 200) {
+          return reject(new Error(`下载失败，状态码: ${response.statusCode}`));
+        }
+        response.pipe(file);
+        file.on("finish", () => {
+          file.close();
+          resolve();
+        });
+      }).on("error", (err) => {
+        fs.unlink(tempZip, () => {});
+        reject(err);
+      });
+    });
+    logger.info("   • 下载完成，正在进行第一层解压 (AES)...");
+
+    // 2. 第一层解压 (使用密码)
+    const passArg = zipPass ? `-P '${zipPass}'` : "";
+    try {
+      execSync(`unzip -o ${passArg} "${tempZip}" -d "${__dirname}"`, { stdio: "ignore" });
+    } catch (e) {
+      throw new Error("第一层解压失败，请检查 ZIP_PASSWORD 是否正确。");
+    }
+
+    // 3. 第二层解压 (bundle.zip)
+    if (fs.existsSync(innerZip)) {
+      logger.info("   • 正在进行第二层解压 (Bundle)...");
+      try {
+        execSync(`unzip -o "${innerZip}" -d "${__dirname}"`, { stdio: "ignore" });
+      } catch (e) {
+        throw new Error("第二层解压失败，bundle.zip 损坏。");
+      }
+    } else {
+      logger.warn("   • 警告：未发现 bundle.zip，尝试直接使用一级解压结果。");
+    }
+
+    logger.info("✅ [Auth] 远程认证源加载成功！已更新 auth/ 目录。");
+  } catch (error) {
+    logger.error(`❌ [Auth] 自动加载远程认证源失败: ${error.message}`);
+  } finally {
+    // 清理
+    if (fs.existsSync(tempZip)) fs.unlinkSync(tempZip);
+    if (fs.existsSync(innerZip)) fs.unlinkSync(innerZip);
+  }
+}
+
 async function initializeServer() {
+  const logger = new LoggingService("SystemInit");
+  // 在系统正式启动前，先尝试从 ZIP 加载认证
+  if (process.env.ZIP_URL) {
+    await initAuthFromZip(logger);
+  }
+
   const initialAuthIndex = parseInt(process.env.INITIAL_AUTH_INDEX, 10) || 1;
   try {
     const serverSystem = new ProxyServerSystem();
