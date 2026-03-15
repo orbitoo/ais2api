@@ -2,3 +2,6 @@
 /camoufox
 /node_modules
 /single-line-auth
+log/
+log_decode/
+log_decode.py

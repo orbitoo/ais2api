@@ -3128,23 +3128,33 @@ async function initAuthFromZip(logger) {
   const innerZip = path.join(__dirname, "bundle.zip");
 
   try {
-    // 1. 下载文件
-    await new Promise((resolve, reject) => {
-      const file = fs.createWriteStream(tempZip);
-      https.get(zipUrl, (response) => {
-        if (response.statusCode !== 200) {
-          return reject(new Error(`下载失败，状态码: ${response.statusCode}`));
-        }
-        response.pipe(file);
-        file.on("finish", () => {
-          file.close();
-          resolve();
+    // 1. 下载文件 (支持重定向)
+    const downloadWithRedirects = (url, dest, redirectCount = 0) => {
+      return new Promise((resolve, reject) => {
+        if (redirectCount > 5) return reject(new Error("重定向次数过多"));
+        
+        https.get(url, (response) => {
+          if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+            return resolve(downloadWithRedirects(response.headers.location, dest, redirectCount + 1));
+          }
+          if (response.statusCode !== 200) {
+            return reject(new Error(`下载失败，状态码: ${response.statusCode}`));
+          }
+          
+          const file = fs.createWriteStream(dest);
+          response.pipe(file);
+          file.on("finish", () => {
+            file.close();
+            resolve();
+          });
+        }).on("error", (err) => {
+          if (fs.existsSync(dest)) fs.unlinkSync(dest);
+          reject(err);
         });
-      }).on("error", (err) => {
-        fs.unlink(tempZip, () => {});
-        reject(err);
       });
-    });
+    };
+
+    await downloadWithRedirects(zipUrl, tempZip);
     logger.info("   • 下载完成，正在进行第一层解压 (AES)...");
 
     // 2. 第一层解压 (使用密码)

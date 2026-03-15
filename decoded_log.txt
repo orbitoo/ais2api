@@ -1,0 +1,5 @@
+
+--- 正在解密: log_1.txt ---
+===== Application Startup at 2026-03-15 08:51:40 =====
+
+[INFO] 2026-03-15T08:52:12.590Z [SystemInit] - [Auth] 探测到 ZIP_URL: https://github.com/fuwei99/ais2api/blob/main/auth.zip，准备拉取远程认证源...
