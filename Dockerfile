@@ -20,14 +20,19 @@ RUN npm install --production
 # 增加默认下载链接 (v135.0.1-beta.24 Linux x86_64)，防止构建时未传 ARG 导致失败。
 ARG CAMOUFOX_URL=https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip
 
-# 安装 unzip 并在完成后清理，保持镜像轻量
-RUN apt-get update && apt-get install -y unzip && \
-    curl -sSL ${CAMOUFOX_URL} -o camoufox.zip && \
-    unzip camoufox.zip -d /app/camoufox-linux && \
-    rm camoufox.zip && \
-    apt-get purge -y unzip && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/* && \
-    chmod +x /app/camoufox-linux/camoufox
+# 拆分步骤进行调试，不使用 && 合并，方便观察哪一步报错
+RUN apt-get update
+RUN apt-get install -y unzip
+RUN curl -sSL ${CAMOUFOX_URL} -o camoufox.zip
+
+# 特别处理 unzip：如果返回 1 (警告) 则认为成功，避免构建中断
+RUN unzip camoufox.zip -d /app/camoufox-linux || [ $? -eq 1 ]
+
+RUN rm camoufox.zip
+RUN chmod +x /app/camoufox-linux/camoufox
+
+# 清理工作分阶段进行
+RUN apt-get purge -y unzip && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # 4. 【核心优化】现在，才拷贝你经常变动的代码文件。
 # 这一步放在后面，确保你修改代码时，前面所有重量级的层都能利用缓存。
