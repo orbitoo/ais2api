@@ -3159,9 +3159,14 @@ async function initAuthFromZip(logger) {
 
     // 2. 第一层解压 (使用密码)
     try {
-      const zip1 = new StreamZip.async({ file: tempZip });
-      const extractOptions = zipPass ? { password: zipPass } : {};
-      await zip1.extract(null, __dirname, extractOptions);
+      // StreamZip 对于加密文件通常需要在实例化时传入密码
+      const zip1 = new StreamZip.async({ 
+        file: tempZip,
+        storeEntries: true,
+        password: zipPass ? zipPass : undefined
+      });
+      // 并在此解压全部文件
+      await zip1.extract(null, __dirname);
       await zip1.close();
     } catch (e) {
       throw new Error(`第一层解压失败: ${e.message}`);
@@ -3171,7 +3176,7 @@ async function initAuthFromZip(logger) {
     if (fs.existsSync(innerZip)) {
       logger.info("   • 正在进行第二层解压 (Bundle)...");
       try {
-        const zip2 = new StreamZip.async({ file: innerZip });
+        const zip2 = new StreamZip.async({ file: innerZip, storeEntries: true });
         await zip2.extract(null, __dirname);
         await zip2.close();
       } catch (e) {
