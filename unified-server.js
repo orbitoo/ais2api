@@ -1671,8 +1671,25 @@ class RequestHandler {
   }
   _buildProxyRequest(req, requestId) {
     let bodyObj = req.body;
+    
+    // 从原生 URL 路径中检查并剥离功能后缀，同时过滤多余的空格编码
+    const isNoThinkingSuffix = req.path.includes("-nothinking");
+    const isSearchSuffix = req.path.includes("-search");
+    
+    const cleanPath = req.path
+      .replace(/-nothinking/g, "")
+      .replace(/-search/g, "")
+      .replace(/%20/g, "")
+      .replace(/ /g, "");
+
+    // 尝试提取模型系列以进行针对性注入
+    let baseModelName = "";
+    const modelMatch = cleanPath.match(/models\/([^:]+)/);
+    if (modelMatch) {
+      baseModelName = modelMatch[1];
+    }
+
     if (
-      this.serverSystem.forceThinking &&
       req.method === "POST" &&
       bodyObj &&
       bodyObj.contents
@@ -1681,15 +1698,43 @@ class RequestHandler {
         bodyObj.generationConfig = {};
       }
 
-      if (!bodyObj.generationConfig.thinkingConfig) {
-        this.logger.info(
-          `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...`,
-        );
-        bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
-      } else {
-        this.logger.info(
-          `[Proxy] ✅ (Google原生格式) 检测到客户端自带推理配置，跳过强制注入。`,
-        );
+      let injectedThinking = false;
+      if (isNoThinkingSuffix) {
+        this.logger.info(`[Proxy] 检测到 -nothinking 后缀 (Google原生格式)，注入推理压制配置...`);
+        if (baseModelName.includes("2.5-pro")) {
+          bodyObj.generationConfig.thinkingConfig = { thinkingBudget: 128 };
+        } else if (
+          baseModelName.includes("3.0") ||
+          baseModelName.includes("3.1") ||
+          baseModelName.includes("3.")
+        ) {
+          bodyObj.generationConfig.thinkingConfig = { thinkingLevel: "LOW" };
+        } else if (
+          baseModelName.includes("2.5-flash") ||
+          baseModelName.includes("flash-lite")
+        ) {
+          bodyObj.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+        }
+        injectedThinking = true;
+      }
+
+      if (!injectedThinking && this.serverSystem.forceThinking) {
+        if (!bodyObj.generationConfig.thinkingConfig) {
+          this.logger.info(
+            `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 includeThoughts: true...`,
+          );
+          bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
+        } else {
+          this.logger.info(
+            `[Proxy] ✅ (Google原生格式) 检测到客户端自带推理配置，跳过强制注入。`,
+          );
+        }
+      }
+
+      if (isSearchSuffix) {
+        this.logger.info(`[Proxy] 检测到 -search 后缀 (Google原生格式)，正在注入 Google Search 工具...`);
+        if (!bodyObj.tools) bodyObj.tools = [];
+        bodyObj.tools.push({ googleSearch: {} });
       }
     }
 
@@ -1699,7 +1744,7 @@ class RequestHandler {
     }
 
     return {
-      path: req.path,
+      path: cleanPath,
       method: req.method,
       headers: req.headers,
       query_params: req.query,
