@@ -17,11 +17,16 @@ COPY package*.json ./
 RUN npm install --production
 
 # 3. 【核心优化】将浏览器下载和解压作为独立的一层。
-# 只要CAMOUFOX_URL不变，这一层就会被缓存。这层体积最大，缓存命中至关重要。
-ARG CAMOUFOX_URL="https://github.com/kagis/camoufox/releases/latest/download/camoufox-linux-x86_64.tar.gz"
-RUN curl -sSL ${CAMOUFOX_URL} -o camoufox-linux.tar.gz && \
-    tar -xzf camoufox-linux.tar.gz && \
-    rm camoufox-linux.tar.gz && \
+# 增加默认下载链接 (v135.0.1-beta.24 Linux x86_64)，防止构建时未传 ARG 导致失败。
+ARG CAMOUFOX_URL=https://github.com/daijro/camoufox/releases/download/v135.0.1-beta.24/camoufox-135.0.1-beta.24-lin.x86_64.zip
+
+# 安装 unzip 并在完成后清理，保持镜像轻量
+RUN apt-get update && apt-get install -y unzip && \
+    curl -sSL ${CAMOUFOX_URL} -o camoufox.zip && \
+    unzip camoufox.zip -d /app/camoufox-linux && \
+    rm camoufox.zip && \
+    apt-get purge -y unzip && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     chmod +x /app/camoufox-linux/camoufox
 
 # 4. 【核心优化】现在，才拷贝你经常变动的代码文件。
