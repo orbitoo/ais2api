@@ -263,6 +263,10 @@ class BrowserManager {
       });
       this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
     }
+
+    // [修复] 提前备份并更新索引，确保后续即使页面加载失败，重试逻辑也能拿到正确的索引
+    this.currentAuthIndex = authIndex;
+
     if (this.context) {
       this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
       await this.context.close();
@@ -531,7 +535,6 @@ class BrowserManager {
           `Guide[${popupStatus.guide ? "Ok" : "No"}]`,
       );
 
-      this.currentAuthIndex = authIndex;
       this._startBackgroundWakeup();
       this.logger.info("[Browser] (后台任务) 🛡️ 监控进程已启动...");
       await this.page.waitForTimeout(1000);
